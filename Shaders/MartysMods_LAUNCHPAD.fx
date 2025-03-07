@@ -47,19 +47,21 @@
 	UI Uniforms
 =============================================================================*/
 
-uniform int OPTICAL_FLOW_RES <
-	ui_type = "combo";
-    ui_label = "Flow Resolution";
-	ui_items = "Quarter Resolution\0Half Resolution\0Full Resolution\0";
-	ui_tooltip = "Higher resolution vectors are more accurate but cost more performance.";
-    ui_category = "Motion Estimation / Optical Flow";
-> = 0;
-
 uniform int OPTICAL_FLOW_Q <
 	ui_type = "combo";
     ui_label = "Flow Quality";
 	ui_items = "Low\0Medium\0High\0";
 	ui_tooltip = "Higher settings produce more accurate results, at a performance cost.";
+	ui_category = "Motion Estimation / Optical Flow";
+> = 0;
+
+uniform int OPTICAL_FLOW_OPT <
+	ui_type = "combo";
+    ui_label = "Flow Optimizer";
+	ui_items = "Sophia (Second-Order Hessian Optimizer)\0Newton\0";
+	ui_tooltip = "Launchpad's Optical Flow uses gradient descent, similar to AI training.\n\n"
+				 "Sophia converges better at high quality settings.\n"
+				 "Newton descents faster at low settings but may converge worse.";
 	ui_category = "Motion Estimation / Optical Flow";
 > = 0;
 
@@ -129,7 +131,7 @@ uniform int UIHELP <
 	ui_category_closed = false;
 >;
 
-
+/*
 uniform float4 tempF1 <
     ui_type = "drag";
     ui_min = -100.0;
@@ -174,10 +176,9 @@ uniform float4 tempF7 <
 
 uniform bool debug_key_down < source = "key"; keycode = 0x46; mode = ""; >;
 
-uniform bool USE_OPTIMIZER <  > = false;
-uniform bool FIRST_STEP_DIRECT <  > = false;
-
-
+uniform bool DISABLE_POOLING <  > = false;
+uniform bool DISABLE_UPSCALING <  > = false;
+*/
 /*=============================================================================
 	Textures, Samplers, Globals, Structs
 =============================================================================*/
@@ -249,10 +250,12 @@ sampler sFlowFeaturesPrevL5  { Texture = FlowFeaturesPrevL5; AddressU = MIRROR; 
 sampler sFlowFeaturesPrevL6  { Texture = FlowFeaturesPrevL6; AddressU = MIRROR; AddressV = MIRROR; };
 sampler sFlowFeaturesPrevL7  { Texture = FlowFeaturesPrevL7; AddressU = MIRROR; AddressV = MIRROR; };
 
-texture LinearDepthCurr      { Width = BUFFER_WIDTH;   Height = BUFFER_HEIGHT;   Format = RG16F; MipLevels=4; };
+//miplevel 3 is copied to previous frame!
+//in theory I should be computing the optical flow at the lower TAAU resolution. Maybe later.
+texture LinearDepthCurr      { Width = BUFFER_WIDTH;   Height = BUFFER_HEIGHT;   Format = R16F; MipLevels = 4; };
 sampler sLinearDepthCurr     { Texture = LinearDepthCurr; }; 
-texture LinearDepthPrev      { Width = BUFFER_WIDTH;   Height = BUFFER_HEIGHT;   Format = R16F; };
-sampler sLinearDepthPrev     { Texture = LinearDepthPrev; };
+texture LinearDepthPrevLo      { Width = BUFFER_WIDTH>>3;   Height = BUFFER_HEIGHT>>3;   Format = R16F; };
+sampler sLinearDepthPrevLo     { Texture = LinearDepthPrevLo; };
 
 struct VSOUT
 {
@@ -268,23 +271,47 @@ struct CSIN
     uint threadid           : SV_GroupIndex;            //flattened idx of thread inside group
 };
 
-static float2 star_kernel[13] = 
+
+//
+//          A
+//
+//	  7   1   4   8
+//
+//		6	0   2
+// 
+//    C   3   6   B
+//
+//          9
+
+//this pattern allows to use isotropic kernels with 4, 7, 10, 13, 16 and 19 samples
+static float2 star_kernel[19] = 
 {
+	//center
 	float2(0, 0),
-	//inner ring
-	float2(-1, -2),
-	float2(1, -2),
-	float2(2, 0),
-	float2(1, 2),
+	//inner ring first 3
 	float2(-1, 2),
+	float2(2, 0),
+	float2(-1, -2),	
+	//inner ring second 3
+	float2(1, 2),
+	float2(1, -2),
 	float2(-2, 0),
-	//outer ring
-	float2(-3, -2),
-	float2(0,-4),
-	float2(3, -2),
+	//outer ring, first 3
+	float2(-3, 2),
 	float2(3, 2),
+	float2(0,-4),
+	//out ring second 3
 	float2(0, 4),
-	float2(-3, 2)
+	float2(3, -2),	
+	float2(-3, -2),
+	//outer outer ring, first 3
+	float2(-4, 0),
+	float2(2, 4),
+	float2(2,-4),
+	//outer outer ring, second 3
+	float2(-2, 4),
+	float2(4, 0),
+	float2(-2, -4)
 };
 
 /*=============================================================================
@@ -334,17 +361,22 @@ sampler2D sStateCounterTex	{ Texture = StateCounterTex;  };
 float4 FrameWriteVS(in uint id : SV_VertexID) : SV_Position {return float4(!debug_key_down, !debug_key_down, 0, 1);}
 float  FrameWritePS(in float4 vpos : SV_Position) : SV_Target0 {return FRAMECOUNT;}
 */
-void WriteCurrFeatureAndDepthPS(in VSOUT i, out float o0 : SV_Target0, out float2 o1 : SV_Target1)
+void WriteCurrFeatureAndDepthPS(in VSOUT i, out float o0 : SV_Target0, out float o1 : SV_Target1)
 {	
 	o0 = dot(0.3333, tex2Dfetch(ColorInput, int2(i.vpos.xy)).rgb);
-	o1.x = Depth::get_linear_depth(i.uv); o1.y = o1.x * o1.x;
+	o1 = Depth::get_linear_depth(i.uv); 
 	//if(FRAMECOUNT > tex2Dfetch(sStateCounterTex, int2(0, 0)).x + 1) discard;
 }
 
-void WritePrevFeatureAndDepthPS(in VSOUT i, out float o0 : SV_Target0, out float2 o1 : SV_Target1)
+void WritePrevFeaturePS(in VSOUT i, out float o : SV_Target0)
 {	
-	o0 = dot(0.3333, tex2Dfetch(ColorInput, int2(i.vpos.xy)).rgb);
-	o1.x = Depth::get_linear_depth(i.uv); o1.y = o1.x * o1.x;
+	o = dot(0.3333, tex2Dfetch(ColorInput, int2(i.vpos.xy)).rgb);	
+	//if(FRAMECOUNT > tex2Dfetch(sStateCounterTex, int2(0, 0)).x) discard;
+}
+
+void WritePrevDepthMipPS(in VSOUT i, out float o : SV_Target0)
+{
+	o = tex2Dlod(sLinearDepthCurr, i.uv, 3).x; //reuse mip calculation for current frame depth	
 	//if(FRAMECOUNT > tex2Dfetch(sStateCounterTex, int2(0, 0)).x) discard;
 }
 
@@ -382,9 +414,6 @@ void DownsampleFeaturesPS4(in VSOUT i, out float2 f0 : SV_Target0, out float2 f1
 void DownsampleFeaturesPS5(in VSOUT i, out float2 f0 : SV_Target0, out float2 f1 : SV_Target1){downsample_features(sFlowFeaturesCurrL4, sFlowFeaturesPrevL4, i.uv, f0, f1);} 
 void DownsampleFeaturesPS6(in VSOUT i, out float2 f0 : SV_Target0, out float2 f1 : SV_Target1){downsample_features(sFlowFeaturesCurrL5, sFlowFeaturesPrevL5, i.uv, f0, f1);}
 void DownsampleFeaturesPS7(in VSOUT i, out float2 f0 : SV_Target0, out float2 f1 : SV_Target1){downsample_features(sFlowFeaturesCurrL6, sFlowFeaturesPrevL6, i.uv, f0, f1);}
-
-float get_curr_depth_new(float2 uv){return tex2Dlod(sLinearDepthCurr, uv, 0).x;}
-float get_prev_depth_new(float2 uv){return tex2Dlod(sLinearDepthPrev, uv, 0).x;}
 
 /*=============================================================================
 	OF - OF
@@ -435,25 +464,52 @@ float loss(float a, float b)
 	return abs(t); //SAD
 }
 
-float4 filter_flow(in VSOUT i, sampler s_flow, const int depth_mip = 2, const int radius = 3)
-{
+float4 filter_flow(in VSOUT i, sampler s_flow, const int depth_mip = 3, const int radius = 3)
+{	
 	float2 txflow = rcp(tex2Dsize(s_flow));
 	float depth = tex2Dlod(sLinearDepthCurr, i.uv, depth_mip).x;
 	float4 blurred = 0;
+
+	float4 center_flow = tex2Dlod(s_flow, i.uv, 0);
+
+	[loop]for(int y = -radius; y <= radius; y++)
+	[loop]for(int x = -radius; x <= radius; x++)
+	{		
+		float2 tuv = i.uv + txflow * float2(x, y) * 2;
+		float4 tap = tex2Dlod(s_flow, tuv, 0);
+		float lw = log2(1.0 + max(0, center_flow.z / (tap.z + 1e-6) - 0.5)); //we want to explicitly get better samples from the neighbours
+		float zw = exp(-abs(tap.w / (depth + 1e-6) - 1) * 64.0);
+		blurred += float4(tap.xyz, 1) * (lw * zw + 1e-7);
+	}
+
+	blurred.xyz /= blurred.w;
+	return float4(blurred.xyz, tex2Dlod(sLinearDepthPrevLo, i.uv + blurred.xy, 0).x);//write prev frame depth for reprojection validation
+}
+
+//can't write to the final flow map when I read it here so
+float4 filter_flow_final(in VSOUT i, sampler s_flow, const int depth_mip = 2, const int radius = 3)
+{
+	float2 txflow = rcp(tex2Dsize(s_flow));
+	float depth = tex2Dlod(sLinearDepthCurr, i.uv, depth_mip).x;
+	float4 blurred = 0;	
 
 	[loop]for(int y = -radius; y <= radius; y++)
 	[loop]for(int x = -radius; x <= radius; x++)
 	{
 		float2 tuv = i.uv + txflow * float2(x, y) * 2;
 		float4 tap = tex2Dlod(s_flow, tuv, 0);
-		float lw = exp(-tap.z * tempF2.y * tempF2.y);
-		float zw = exp(-abs(tap.w - depth)/depth * tempF2.z * tempF2.z);
-		blurred += float4(tap.xyz, 1) * (lw * zw + 1e-6);
+		float lw = exp(-tap.z * 16.0); //regular relative weighting
+		float zw = exp(-abs(tap.w / (depth + 1e-6) - 1) * 64.0);
+		blurred += float4(tap.xyz, 1) * (lw * zw + 1e-7);
 	}
 
 	blurred.xyz /= blurred.w;
 	return float4(blurred.xyz, depth);
 }
+
+//I calculate gradient of block matching loss, and this requires matching the blocks 3 times for finite differences
+//doing tex2Dgather once and manually interpolating makes the algorithm almost twice as fast.
+#define FLOW_USE_GATHER_GRADIENT 1
 
 float4 calc_flow(VSOUT i,
 					 sampler s_feature_curr, 
@@ -468,16 +524,23 @@ float4 calc_flow(VSOUT i,
 		float randphi = get_jitter_blue(i.vpos.xy).x;
 		float2 sc; sincos(randphi * TAU / 6.0, sc.x, sc.y);
 		km = float2x2(sc.y, -sc.x, sc.x, sc.y);		
-	}	
-
+	}
+	
 	float2 texelsize = rcp(tex2Dsize(s_feature_curr));
+	float2 texsize = tex2Dsize(s_feature_curr);
 
-	float2 deltax = texelsize * float2(0.01, 0);
-	float2 deltay = texelsize * float2(0, 0.01);
-
-	float local_block[13];	
+	float local_block[16];	
 	[unroll]for(uint k = 0; k < blocksize; k++) 
-		local_block[k] = tex2Dlod(s_feature_curr, i.uv + mul(star_kernel[k], km) * texelsize, 0).x;
+	{
+		float2 tuv = i.uv + mul(star_kernel[k], km) * texelsize;
+#if FLOW_USE_GATHER_GRADIENT					
+		float4 texels = tex2DgatherR(s_feature_curr, tuv);
+		float2 lambda = frac(tuv * texsize - 0.5);
+		local_block[k] = lerp(lerp(texels.w, texels.z, lambda.x), lerp(texels.x, texels.y, lambda.x), lambda.y);		
+#else
+		local_block[k] = tex2Dlod(s_feature_curr, tuv, 0).x;
+#endif		
+	}		
 
 	float2 total_motion = 0;
 	
@@ -488,24 +551,35 @@ float4 calc_flow(VSOUT i,
 	}	
 	
 	float3 SAD = 0;
+	float delta = 0.01;
 
 	[unroll]
 	for(uint k = 0; k < blocksize; k++)
 	{		
-		float2 tuv = i.uv + mul(star_kernel[k], km) * texelsize;
-		float g = local_block[k];
+		float2 tuv = i.uv + mul(star_kernel[k], km) * texelsize + total_motion;		
 		float3 f;
-		f.x = tex2Dlod(s_feature_prev, tuv + total_motion,          0).x; 
-		f.y = tex2Dlod(s_feature_prev, tuv + total_motion + deltax, 0).x;	
-		f.z = tex2Dlod(s_feature_prev, tuv + total_motion + deltay, 0).x; 
+#if FLOW_USE_GATHER_GRADIENT		
+		//I should be interpolating away from the pixel boundaries and flip the gradient to avoid interpolating beyond the pixel bounds
+		//but this is nearly as accurate and faster.
+		float4 texels = tex2DgatherR(s_feature_prev, tuv);
+		float2 lambda = frac(tuv * texsize - 0.5);
+		f.x = lerp(lerp(texels.w, texels.z, lambda.x),         lerp(texels.x, texels.y, lambda.x),         lambda.y        );
+		f.y = lerp(lerp(texels.w, texels.z, lambda.x + delta), lerp(texels.x, texels.y, lambda.x + delta), lambda.y        );	
+		f.z = lerp(lerp(texels.w, texels.z, lambda.x),         lerp(texels.x, texels.y, lambda.x),         lambda.y + delta);
+#else 
+		f.x = tex2Dlod(s_feature_prev, tuv         						   , 0).x; 
+		f.y = tex2Dlod(s_feature_prev, tuv + float2(texelsize.x * delta, 0), 0).x;	
+		f.z = tex2Dlod(s_feature_prev, tuv + float2(0, texelsize.y * delta), 0).x;
+#endif		
+		float g = local_block[k];
 		SAD.x += loss(f.x, g);
 		SAD.y += loss(f.y, g);
-		SAD.z += loss(f.z, g);		
+		SAD.z += loss(f.z, g);					
     }
 
-	float2 grad = (SAD.yz - SAD.x) / float2(deltax.x, deltay.y);
-	
-	int num_steps = int(saturate(tempF1.x) * 16) + level * 2;
+	float2 grad = (SAD.yz - SAD.x) * texsize / delta;
+
+	int num_steps = (4 + level) * (1 + 3 * OPTICAL_FLOW_Q);
 	//num_steps = level >= 2 ? 2 * num_steps : num_steps;
 
 	float2 local_motion = 0;
@@ -513,29 +587,53 @@ float4 calc_flow(VSOUT i,
 	float  best_SAD = SAD.x;
 
 	SophiaOptimizer sophia = init_sophia();
-	sophia.lr *= 1.0 + level; 
+	sophia.lr *= 1.0 + level;
 
 	[loop]
 	for(int j = 0; j < num_steps; j++)
 	{
-		//float2 curr_grad_step = grad / (1e-10 + dot(grad, grad)) * SAD.x * 0.8;
-		float2 curr_grad_step = update_sophia(sophia, grad);
-		local_motion -= curr_grad_step;
-		SAD = 0;
+		float2 curr_grad_step = 0;
 
+		if(OPTICAL_FLOW_OPT == 0) //SophiaG
+		{
+			curr_grad_step = update_sophia(sophia, grad);
+		}
+		else 
+		{
+			curr_grad_step = grad / (1e-15 + dot(grad, grad)) * SAD.x;			
+		}
+
+		//gradient clipping
+		float gg = sqrt(dot(curr_grad_step, curr_grad_step)) + 1e-8;
+		float clip_ratio = min(gg, 0.3333 * length(texelsize)) / gg; 
+		curr_grad_step *= clip_ratio;	
+		
+		local_motion -= curr_grad_step;		
+		SAD = 0;
+	
 		[unroll]
 		for(uint k = 0; k < blocksize; k++)
 		{
-			float2 tuv = i.uv + total_motion + local_motion + mul(star_kernel[k], km) * texelsize;
-			float g = local_block[k];
+			float2 tuv = i.uv + total_motion + local_motion + mul(star_kernel[k], km) * texelsize;			
 			float3 f;
-			f.x = tex2Dlod(s_feature_prev, tuv,          0).x; 
-			f.y = tex2Dlod(s_feature_prev, tuv + deltax, 0).x;	
-			f.z = tex2Dlod(s_feature_prev, tuv + deltay, 0).x;
+#if FLOW_USE_GATHER_GRADIENT
+			float4 texels = tex2DgatherR(s_feature_prev, tuv);
+			float2 lambda = frac(tuv * texsize - 0.5);
+			f.x = lerp(lerp(texels.w, texels.z, lambda.x),         lerp(texels.x, texels.y, lambda.x),         lambda.y        );
+			f.y = lerp(lerp(texels.w, texels.z, lambda.x + delta), lerp(texels.x, texels.y, lambda.x + delta), lambda.y        );	
+			f.z = lerp(lerp(texels.w, texels.z, lambda.x),         lerp(texels.x, texels.y, lambda.x),         lambda.y + delta);
+#else 
+			f.x = tex2Dlod(s_feature_prev, tuv,          						 0).x; 
+			f.y = tex2Dlod(s_feature_prev, tuv + float2(texelsize.x * delta, 0), 0).x;	
+			f.z = tex2Dlod(s_feature_prev, tuv + float2(0, texelsize.y * delta), 0).x;
+#endif			
+			float g = local_block[k];	
 			SAD.x += loss(f.x, g);
 			SAD.y += loss(f.y, g);
-			SAD.z += loss(f.z, g);
+			SAD.z += loss(f.z, g);			
 		}
+
+		grad = (SAD.yz - SAD.x) * texsize / delta;
 
 		[branch]
 		if(SAD.x < best_SAD) 
@@ -545,30 +643,39 @@ float4 calc_flow(VSOUT i,
 		}
 		else 
 		{
-			num_steps--;
-		}
-
-		grad = (SAD.yz - SAD.x) / float2(deltax.x, deltay.y);			
+			j++;
+		}				
 	}
 
 	total_motion += best_local_motion;
-	float currdepth = tex2Dlod(sLinearDepthCurr, i.uv, 2).x;
-	float4 curr_layer = float4(total_motion, best_SAD, currdepth);
+	float depth_key = 0;
+	[flatten]
+	if(level == 0) //upscaling should be bilateral on curr frame depth, more accurate
+	{
+		depth_key = tex2Dlod(sLinearDepthCurr, i.uv, 2).x; //2 -> upscale
+	}
+	else //vector pooling makes more sense to measure prev frame reprojection error, less flickery
+	{
+		depth_key = tex2Dlod(sLinearDepthPrevLo, i.uv + total_motion, 0).x;
+	}
+
+	float4 curr_layer = float4(total_motion, best_SAD, depth_key);
 	return curr_layer;
 }
 
 void FilterFlowPS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow(i, sMotionTexNewB);}
-void BlockMatchingPassNewPS7(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL7, sFlowFeaturesPrevL7, sMotionTexNewA, 7, 13);}
-void BlockMatchingPassNewPS6(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL6, sFlowFeaturesPrevL6, sMotionTexNewA, 6, 13);}
-void BlockMatchingPassNewPS5(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL5, sFlowFeaturesPrevL5, sMotionTexNewA, 5, 13);}
-void BlockMatchingPassNewPS4(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL4, sFlowFeaturesPrevL4, sMotionTexNewA, 4, 13);}
-void BlockMatchingPassNewPS3(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL3, sFlowFeaturesPrevL3, sMotionTexNewA, 3, 13);}
+void BlockMatchingPassNewPS7(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL7, sFlowFeaturesPrevL7, sMotionTexNewA, 7, 10);}
+void BlockMatchingPassNewPS6(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL6, sFlowFeaturesPrevL6, sMotionTexNewA, 6, 10);}
+void BlockMatchingPassNewPS5(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL5, sFlowFeaturesPrevL5, sMotionTexNewA, 5, 10);}
+void BlockMatchingPassNewPS4(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL4, sFlowFeaturesPrevL4, sMotionTexNewA, 4, 10);}
+void BlockMatchingPassNewPS3(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL3, sFlowFeaturesPrevL3, sMotionTexNewA, 3, 10);}
 void BlockMatchingPassNewPS2(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL2, sFlowFeaturesPrevL2, sMotionTexNewA, 2, 13);}
-void BlockMatchingPassNewPS1(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL1, sFlowFeaturesPrevL1, sMotionTexNewA, 1, 13);}
-void BlockMatchingPassNewPS0(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL0, sFlowFeaturesPrevL0, sMotionTexNewA, 0, 13);}
-void UpscaleFilter8to4PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow(i, sMotionTexNewB, 2, 3);}
-void UpscaleFilter4to2PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow(i, sMotionTexUpscale, 1, 2);}
-void UpscaleFilter2to1PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow(i, sMotionTexUpscale2, 0, 1);}
+void BlockMatchingPassNewPS1(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL1, sFlowFeaturesPrevL1, sMotionTexNewA, 1, 16);}
+void BlockMatchingPassNewPS0(in VSOUT i, out float4 o : SV_Target0){o = calc_flow(i, sFlowFeaturesCurrL0, sFlowFeaturesPrevL0, sMotionTexNewA, 0, 16);}
+
+void UpscaleFilter8to4PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow_final(i, sMotionTexNewB, 2, 3);}
+void UpscaleFilter4to2PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow_final(i, sMotionTexUpscale, 1, 2);}
+void UpscaleFilter2to1PS(in VSOUT i, out float4 o : SV_Target0){o = filter_flow_final(i, sMotionTexUpscale2, 0, 1);}
 
 /*=============================================================================
 	Shader Entry Points - Normals
@@ -596,29 +703,32 @@ void NormalsPS(in VSOUT i, out float4 o : SV_Target0)
 	float2 z_prev;
 	z_prev.x = Depth::get_linear_depth(i.uv + dirs[0]);
 	z_prev.y = Depth::get_linear_depth(i.uv + dirs[0] * 2);
+	float3 dv_prev = Camera::uv_to_proj(i.uv + dirs[0], Camera::depth_to_z(z_prev.x)) - center_pos;
 
 	float4 best_normal = float4(0,0,0,100000);
 	float4 weighted_normal = 0;
 
-	[loop]
+	[unroll]
 	for(int j = 1; j < 9; j++)
 	{
 		float2 z_curr;
 		z_curr.x = Depth::get_linear_depth(i.uv + dirs[j]);
 		z_curr.y = Depth::get_linear_depth(i.uv + dirs[j] * 2);
 
-		float2 z_guessed = 2 * float2(z_prev.x, z_curr.x) - float2(z_prev.y, z_curr.y);
-		float score = dot(1, abs(z_guessed - z_center));
-	
-		float3 dd_0 = Camera::uv_to_proj(i.uv + dirs[j],     Camera::depth_to_z(z_curr.x)) - center_pos;
-		float3 dd_1 = Camera::uv_to_proj(i.uv + dirs[j - 1], Camera::depth_to_z(z_prev.x)) - center_pos;
-		float3 temp_normal = cross(dd_0, dd_1);
-		float w = rcp(dot(temp_normal, temp_normal));
-		w *= rcp(score * score + exp2(-32.0));
-		weighted_normal += float4(temp_normal, 1) * w;	
+		float3 dv_curr = Camera::uv_to_proj(i.uv + dirs[j], Camera::depth_to_z(z_curr.x)) - center_pos;	
+		float3 temp_normal = cross(dv_curr, dv_prev);
 
-		best_normal = score < best_normal.w ? float4(temp_normal, score) : best_normal;
+		float2 z_guessed = 2 * float2(z_prev.x, z_curr.x) - float2(z_prev.y, z_curr.y);
+		float error = dot(1, abs(z_guessed - z_center));
+		
+		float w = rcp(dot(temp_normal, temp_normal));
+		w *= rcp(error * error + exp2(-32.0));
+		
+		weighted_normal += float4(temp_normal, 1) * w;	
+		best_normal = error < best_normal.w ? float4(temp_normal, error) : best_normal;
+
 		z_prev = z_curr;
+		dv_prev = dv_curr;
 	}
 
 	float3 normal = weighted_normal.w < 1.0 ? best_normal.xyz : weighted_normal.xyz;
@@ -913,16 +1023,13 @@ float3 AgX_to_srgb(float3 AgX)
     return mul(fromagx, AgX);            
 }
 
-uniform bool ASSUME_SRGB_INPUT <
-    ui_label = "Assume sRGB input";
-    ui_tooltip = "Converts color to linear before converting to HDR.\nDepending on the game color format, this can improve light behavior and blending.";
-    ui_category = "Experimental";
-> = true;
+#define degamma(_v) ((_v)*0.283799*((2.52405+(_v))*(_v)))
+#define regamma(_v) (1.14374*(-0.126893*(_v)+sqrt(_v)))
 
 float3 unpack_hdr_rtgi(float3 color)
 {
     color  = saturate(color);   
-    if(ASSUME_SRGB_INPUT) color = color*0.283799*((2.52405+color)*color);  
+    color = degamma(color);
     color = srgb_to_AgX(color);
     color = color * rcp(1.04 - saturate(color));    
     return color;
@@ -933,7 +1040,7 @@ float3 pack_hdr_rtgi(float3 color)
     color =  1.04 * color * rcp(color + 1.0);   
     color = AgX_to_srgb(color);    
     color  = saturate(color);
-    if(ASSUME_SRGB_INPUT) color = 1.14374*(-0.126893*color+sqrt(color));
+    color = regamma(color);
     return color;     
 }
 
@@ -953,11 +1060,6 @@ float3 cone_overlap_inv(float3 c)
     return mul(c, m);
 }
 
-#define degamma(_v) ((_v)*0.283799*((2.52405+(_v))*(_v)))
-#define regamma(_v) (1.14374*(-0.126893*(_v)+sqrt(_v)))
-
-#define WHITEPOINT 12.0 //don't change, it has a miniscule impact on the image, but low values will cause whites to be dimmed
-
 float3 sdr_to_hdr(float3 c)
 { 
 	return unpack_hdr_rtgi(c);    
@@ -976,7 +1078,6 @@ float get_sdr_luma(float3 c)
     return lum;
 }
 
-#define INTENSITY 					1.0
 #define ALBEDO_EXPOSURE_TARGET 		0.3
 #define ALBEDO_RES_SCALE  			3
 
@@ -1199,7 +1300,7 @@ float weightnorm(float4 v[4])
 float balance(int layer)
 {
     float x = float(layer)/float(TARGET_MIP);
-    return exp2(-x * 3.0 * tempF7.x);
+    return exp2(-x * 6.0);
 }
 
 void FuseExposuresPS(in VSOUT i, out float2 o : SV_Target0)
@@ -1272,7 +1373,7 @@ void FuseExposuresPS(in VSOUT i, out float2 o : SV_Target0)
     o.y /= ALBEDO_RES_SCALE * ALBEDO_RES_SCALE; 
 }
 
-void UpsampleAtlasPS(in VSOUT i, out float4 o : SV_Target0)
+void UpsampleAtlasPS(in VSOUT i, out float3 o : SV_Target0)
 {
     float3 c = tex2D(ColorInput, i.uv).rgb;
     
@@ -1314,22 +1415,16 @@ void UpsampleAtlasPS(in VSOUT i, out float4 o : SV_Target0)
     float3 target_hdr = sdr_to_hdr(ALBEDO_EXPOSURE_TARGET.xxx);
     float3 current_hdr = sdr_to_hdr(0.5);
     o.rgb *= target_hdr / current_hdr;
-    o.rgb = hdr_to_sdr(o.rgb);    
-    o.w = 1;
 
-	{
-		o.rgb = saturate(o.rgb);   
-		o.rgb = o.rgb*0.283799*((2.52405+o.rgb)*o.rgb);  
-		o.rgb = srgb_to_AgX(o.rgb);
-
-		//given scene color is lighting * albedo + lighting * albedo² * k + lighting*albedo³ * k² ... due to multiple bounces
-		//with a probability falloff for each consecutive bounce happening. This causes the actual albedo mostly being less saturated
-		//than the apparent scene color. I'm fudging things here by assuming a constant white light source. If we invert the MacLaurin series
-		//to get the actual source albedo given our assumptions, this turns out to be... a reinhard tonemap curve lmao
-		float maclaurin_power = 0.8; 
-		float3 albedoinversed = o.rgb / (1.0 + maclaurin_power * o.rgb);
-		o.rgb = dot(o.rgb, 0.33333) * albedoinversed / (1e-6 + dot(albedoinversed, 0.33333));	
-	}
+	//Let L = lighting, A = albedo, C = final scene color, p = multiscatter probability
+	//then  C = L * (A + p * A + p² * A ....)
+	//this means the final color is a combination of single and multiscattering. I'm fudging things here with a constant light
+	//but if we invert this MacLaurin series to get the actual albedo A, we get... a reinhard tonemap curve lmao	
+	float3 L = 1; //assumed lighting
+	float3 C = o.rgb;
+	float p = 1.0; //backscatter probability, lambert we assume 1
+	o.rgb = C / (L + C * p);
+	return;
 }
 
 texture RTGI_AlbedoTexV3      { Width = BUFFER_WIDTH;   Height = BUFFER_HEIGHT; Format = RGBA16F; };
@@ -1353,39 +1448,64 @@ void DebugPS(in VSOUT i, out float3 o : SV_Target0)
 			int qq = q.x * 2 + q.y;
 			if(qq == 0) o = Deferred::get_normals(tuv) * 0.5 + 0.5;
 			if(qq == 1) o = gradient(Depth::get_linear_depth(tuv));
-			if(qq == 2) o = showmotion(Deferred::get_motion(tuv));	
+			//if(qq == 2) o = showmotion(Deferred::get_motion(tuv));	
 			if(qq == 3) o = tex2Dlod(ColorInput, tuv, 0).rgb;	
 			break;			
 		}
 		case 1: o = showmotion(Deferred::get_motion(i.uv)); break;
-		case 2:
-		{
-			float2 tile_size = 16.0;
-			float2 tile_uv = i.uv * BUFFER_SCREEN_SIZE / tile_size;
-			float2 motion = Deferred::get_motion((floor(tile_uv) + 0.5) * tile_size * BUFFER_PIXEL_SIZE);
-
-			float3 chroma = showmotion(motion);
-			
-			motion *= BUFFER_SCREEN_SIZE;
-			float velocity = length(motion);
-			float2 mainaxis = velocity == 0 ? 0 : motion / velocity;
-			float2 otheraxis = float2(mainaxis.y, -mainaxis.x);
-			float2x2 rotation = float2x2(mainaxis, otheraxis);
-
-			tile_uv = (frac(tile_uv) - 0.5) * tile_size;
-			tile_uv = mul(tile_uv, rotation);
-			o = tex2Dlod(ColorInput, i.uv, 0).rgb;
-			float mask = smoothstep(min(velocity, 2.5), min(velocity, 2.5) - 1, abs(tile_uv.y)) * smoothstep(velocity, velocity - 1.0, abs(tile_uv.x));
-
-			o = lerp(o, chroma, mask);
-			break;
-		}
+		case 2: o = tex2Dlod(ColorInput, i.uv, 0).rgb; break;		
 		case 3: o = Deferred::get_normals(i.uv) * 0.5 + 0.5; break;
 		case 4: o = gradient(Depth::get_linear_depth(i.uv)); break;
 	}
-
-	//o = tex2D(sRTGI_AlbedoTexV3, i.uv).rgb;	
 }
+
+#define FLOW_VECTOR_DENSITY_INV 16
+#define NUM_VECTORS_X (BUFFER_WIDTH / FLOW_VECTOR_DENSITY_INV)
+#define NUM_VECTORS_Y (BUFFER_HEIGHT / FLOW_VECTOR_DENSITY_INV / 0.866)
+
+void FlowVectorDebugVS(in uint id : SV_VertexID, out float4 vpos : SV_Position, out float2 uv : TEXCOORD0, out float4 color : LINECOLOR)
+{
+	if(DEBUG_MODE != 2) 
+	{
+		vpos = color = -100000;
+		return;
+	}
+
+	uint tri_id = id / 3;
+
+	float2 gridpos = float2(tri_id % NUM_VECTORS_X, tri_id / NUM_VECTORS_X);
+	gridpos = (gridpos + 0.5) / float2(NUM_VECTORS_X, NUM_VECTORS_Y);
+	gridpos.x += 0.5 / NUM_VECTORS_X * ((tri_id / NUM_VECTORS_X) % 2);
+
+	float2 mv = Deferred::get_motion(gridpos) * BUFFER_SCREEN_SIZE.xy;	
+	float s = length(mv);
+	float2 d = mv / (1e-8 + s);	
+
+	float2x2 shape_mat = float2x2(d.x, -d.y, d.y, d.x);
+	float2x2 scale_mat = float2x2(s, 0, 0, 4.0);
+
+	shape_mat = mul(shape_mat, scale_mat);
+
+	const float2 tri_offsets[3] = 
+	{
+		float2(1, 0),
+		float2(-0.5, 0.866),
+		float2(-0.5, -0.866)
+	};
+	
+	uv = tri_offsets[id % 3];
+	vpos.xy = gridpos + mul(shape_mat, uv) * BUFFER_PIXEL_SIZE.xy;
+	vpos  = float4(vpos.xy * float2(2, -2) + float2(-1, 1), 0, 1);
+	color = float4(showmotion(mv), 1);
+}
+
+float4 FlowVectorDebugPS(in float4 vpos : SV_Position, in float2 uv : TEXCOORD0, in float4 color : LINECOLOR) : SV_Target0
+{
+	float r = length(uv);
+	color.w *= smoothstep(0.5, 0.5-fwidth(r), r);	
+	return color;
+}
+
 #endif
 
 /*=============================================================================
@@ -1439,7 +1559,8 @@ technique MartysMods_Launchpad
 	pass {VertexShader = MainVS;PixelShader = UpscaleFilter8to4PS;	RenderTarget = MotionTexUpscale;}
 	pass {VertexShader = MainVS;PixelShader = UpscaleFilter4to2PS;	RenderTarget = MotionTexUpscale2;}
 	pass {VertexShader = MainVS;PixelShader = UpscaleFilter2to1PS;	RenderTarget = Deferred::MotionVectorsTex;}
-	pass {VertexShader = MainVS;PixelShader = WritePrevFeatureAndDepthPS;RenderTarget0 = FlowFeaturesPrevL0;RenderTarget1 = LinearDepthPrev;}
+	pass {VertexShader = MainVS;PixelShader = WritePrevFeaturePS;RenderTarget0 = FlowFeaturesPrevL0;}
+	pass {VertexShader = MainVS;PixelShader = WritePrevDepthMipPS;RenderTarget0 = LinearDepthPrevLo;}
 
 	//Smooth Normals
 	pass {VertexShader = MainVS;PixelShader = NormalsPS; RenderTarget = Deferred::NormalsTexV3; }	
@@ -1480,8 +1601,19 @@ technique MartysMods_Launchpad
 #endif
     pass{VertexShader = MainVS; PixelShader = FuseExposuresPS;  RenderTarget0 = LPFusedExposureTex;}  
 	pass{VertexShader = MainVS; PixelShader = UpsampleAtlasPS;  RenderTarget = RTGI_AlbedoTexV3;}
-#if LAUNCHPAD_DEBUG_OUTPUT != 0 //why waste perf for this pass in normal mode
-	//pass {VertexShader = MainVS;PixelShader  = DebugPS;  }			
-#endif
 
+#if LAUNCHPAD_DEBUG_OUTPUT != 0 //why waste perf for this pass in normal mode
+	pass {VertexShader = MainVS;PixelShader  = DebugPS;  }	
+	pass 
+	{
+		PrimitiveTopology = TRIANGLELIST;
+		VertexCount = NUM_VECTORS_X * NUM_VECTORS_Y * 3;
+		VertexShader = FlowVectorDebugVS;
+		PixelShader  = FlowVectorDebugPS;
+		BlendEnable=true;
+		BlendOp=ADD;
+		SrcBlend=SRCALPHA;
+		DestBlend=INVSRCALPHA;
+	} 		
+#endif
 }
