@@ -115,21 +115,10 @@ uniform int DEBUG_MODE <
     ui_type = "combo";
 	ui_items = "All\0Optical Flow\0Optical Flow Vectors\0Normals\0Depth\0";
 	ui_label = "Debug Output";
+	ui_category = "Debug";
 > = 0;
 #endif
 
-uniform int UIHELP <
-	ui_type = "radio";
-	ui_label = " ";	
-	ui_text ="\nDescription for preprocessor definitions:\n"
-	"\n"
-	"LAUNCHPAD_DEBUG_OUTPUT\n"
-	"\n"
-	"Various debug outputs\n"
-	"0: off\n"
-	"1: on\n";
-	ui_category_closed = false;
->;
 
 /*
 uniform float4 tempF1 <
@@ -335,7 +324,7 @@ float3 showmotion(float2 motion)
 	float angle = atan2(motion.y, motion.x);
 	float dist = length(motion);
 	float3 rgb = saturate(3 * abs(2 * frac(angle / 6.283 + float3(0, -1.0/3.0, 1.0/3.0)) - 1) - 1);
-	return lerp(0.5, rgb, saturate(log(1 + dist * 400.0  /* / FRAMETIME */)));//normalize by frametime such that we don't need to adjust visualization intensity all the time
+	return lerp(0.5, rgb, saturate(log(1 + dist * 1000.0  / FRAMETIME )));//normalize by frametime such that we don't need to adjust visualization intensity all the time
 }
 
 //turbo colormap fit, turned into MADD form
@@ -458,12 +447,6 @@ float2 update_sophia(inout SophiaOptimizer s, float2 grad)
 	return s.lr * mnorm * ratio;
 }
 
-float loss(float a, float b)
-{
-	float t = a - b;
-	return abs(t); //SAD
-}
-
 float4 filter_flow(in VSOUT i, sampler s_flow, const int depth_mip = 3, const int radius = 3)
 {	
 	float2 txflow = rcp(tex2Dsize(s_flow));
@@ -505,6 +488,12 @@ float4 filter_flow_final(in VSOUT i, sampler s_flow, const int depth_mip = 2, co
 
 	blurred.xyz /= blurred.w;
 	return float4(blurred.xyz, depth);
+}
+
+float loss(float a, float b)
+{
+	float t = a - b;
+	return abs(t); //SAD
 }
 
 //I calculate gradient of block matching loss, and this requires matching the blocks 3 times for finite differences
