@@ -119,7 +119,6 @@ uniform int DEBUG_MODE <
 > = 0;
 #endif
 
-
 /*
 uniform float4 tempF1 <
     ui_type = "drag";
@@ -268,7 +267,7 @@ struct CSIN
 //
 //		6	0   2
 // 
-//    C   3   6   B
+//    C   3   5   B
 //
 //          9
 
@@ -519,6 +518,7 @@ float4 calc_flow(VSOUT i,
 	float2 texsize = tex2Dsize(s_feature_curr);
 
 	float local_block[16];	
+	float2 minmax = float2(1, 0);
 	[unroll]for(uint k = 0; k < blocksize; k++) 
 	{
 		float2 tuv = i.uv + mul(star_kernel[k], km) * texelsize;
@@ -528,7 +528,8 @@ float4 calc_flow(VSOUT i,
 		local_block[k] = lerp(lerp(texels.w, texels.z, lambda.x), lerp(texels.x, texels.y, lambda.x), lambda.y);		
 #else
 		local_block[k] = tex2Dlod(s_feature_curr, tuv, 0).x;
-#endif		
+#endif	
+		minmax = float2(min(local_block[k], minmax.x), max(local_block[k], minmax.y));	
 	}		
 
 	float2 total_motion = 0;
@@ -648,6 +649,7 @@ float4 calc_flow(VSOUT i,
 		depth_key = tex2Dlod(sLinearDepthPrevLo, i.uv + total_motion, 0).x;
 	}
 
+	//if(abs(minmax.y - minmax.x) < (tempF1.x * tempF1.x * tempF1.x)) total_motion = 0;
 	float4 curr_layer = float4(total_motion, best_SAD, depth_key);
 	return curr_layer;
 }
