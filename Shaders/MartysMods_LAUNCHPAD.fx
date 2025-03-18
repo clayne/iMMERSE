@@ -166,7 +166,8 @@ uniform bool debug_key_down < source = "key"; keycode = 0x46; mode = ""; >;
 
 uniform bool DISABLE_POOLING <  > = false;
 uniform bool DISABLE_UPSCALING <  > = false;
-*/
+uniform bool USE_ALBEDO_FOR_NORMALS <  > = false;*/
+
 /*=============================================================================
 	Textures, Samplers, Globals, Structs
 =============================================================================*/
@@ -913,8 +914,6 @@ void SmoothNormalsPass1PS(in VSOUT i, out float4 o : SV_Target0)
 	if(ENABLE_TEXTURED_NORMALS)
 	{
 		float3 p = Camera::uv_to_proj(i.uv);
-		float luma = dot(tex2D(ColorInput, i.uv).rgb, 0.3333);
-
 		float3 e_y = (p - Camera::uv_to_proj(i.uv + BUFFER_PIXEL_SIZE_DLSS * float2(0, 2)));
 		float3 e_x = (p - Camera::uv_to_proj(i.uv + BUFFER_PIXEL_SIZE_DLSS * float2(2, 0)));
 		e_y = normalize(cross(n, e_y));
@@ -925,8 +924,8 @@ void SmoothNormalsPass1PS(in VSOUT i, out float4 o : SV_Target0)
 		float3 v_y = e_y * radius_scale;
 		float3 v_x = e_x * radius_scale;
 
-		float3 center_color = tex2D(ColorInput, i.uv).rgb;
-		float center_luma = dot(center_color * center_color, float3(0.2126, 0.7152, 0.0722));
+		float3 center_color = Deferred::get_albedo(i.uv);
+		float center_luma = dot(center_color, float3(0.2126, 0.7152, 0.0722));
 
 		float3 center_p_height = p + center_luma * n;
 		float3 summed_normal = n * 0.01;
@@ -954,8 +953,8 @@ void SmoothNormalsPass1PS(in VSOUT i, out float4 o : SV_Target0)
 				float2 uv = Camera::proj_to_uv(virtual_p);	
 				float3 actual_p = Camera::uv_to_proj(uv);
 
-				float3 tap_color = tex2Dlod(ColorInput, uv, 0).rgb;
-				float tap_luma = dot(tap_color * tap_color, float3(0.2126, 0.7152, 0.0722));
+				float3 tap_color = Deferred::get_albedo(uv);
+				float tap_luma = dot(tap_color, float3(0.2126, 0.7152, 0.0722));
 				total_luma += tap_luma;
 				
 				height[a] = virtual_p + tap_luma * n;
@@ -1291,7 +1290,8 @@ float weightnorm(float4 v[4])
 float balance(int layer)
 {
     float x = float(layer)/float(TARGET_MIP);
-    return exp2(-x * 6.0);
+	return saturate(1 - x) * saturate(1 - x);
+    //return exp2(-x * 6.0);
 }
 
 void FuseExposuresPS(in VSOUT i, out float2 o : SV_Target0)
@@ -1417,9 +1417,6 @@ void UpsampleAtlasPS(in VSOUT i, out float3 o : SV_Target0)
 	o.rgb = C / (L + C * p);
 	return;
 }
-
-texture RTGI_AlbedoTexV3      { Width = BUFFER_WIDTH;   Height = BUFFER_HEIGHT; Format = RGBA16F; };
-sampler sRTGI_AlbedoTexV3     { Texture = RTGI_AlbedoTexV3; };
 
 /*=============================================================================
 	Debug
@@ -1553,14 +1550,7 @@ technique MartysMods_Launchpad
 	pass {VertexShader = MainVS;PixelShader = WritePrevFeaturePS;RenderTarget0 = FlowFeaturesPrevL0;}
 	pass {VertexShader = MainVS;PixelShader = WritePrevDepthMipPS;RenderTarget0 = LinearDepthPrevLo;}
 
-	//Smooth Normals
-	pass {VertexShader = MainVS;PixelShader = NormalsPS; RenderTarget = Deferred::NormalsTexV3; }	
-	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsMakeGbufPS;  RenderTarget = SmoothNormalsTempTex0;}
-	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsPass0PS;  RenderTarget = SmoothNormalsTempTex1;}
-	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsPass1PS;  RenderTarget = SmoothNormalsTempTex2;}
-	pass {VertexShader = SmoothNormalsVS;PixelShader = CopyNormalsPS; RenderTarget = Deferred::NormalsTexV3; }
-
-	//RTGI Albedo Map
+	//Albedo Map - doing it before the main pass so we can use it for textured normals, normalized brightness
 	pass{VertexShader = MainVS; PixelShader = InitAtlasPyramidPS;   RenderTarget0 = LPWeightAtlasL0;}	
 #if TARGET_MIP >= 1
     pass    {VertexShader = MainVS;PixelShader = DownsamplePyramidsPS0H;  RenderTarget0 = LPWeightAtlasL1Tmp; } 
@@ -1591,7 +1581,14 @@ technique MartysMods_Launchpad
     pass    {VertexShader = MainVS;PixelShader = DownsamplePyramidsPS6V;  RenderTarget0 = LPWeightAtlasL7; }
 #endif
     pass{VertexShader = MainVS; PixelShader = FuseExposuresPS;  RenderTarget0 = LPFusedExposureTex;}  
-	pass{VertexShader = MainVS; PixelShader = UpsampleAtlasPS;  RenderTarget = RTGI_AlbedoTexV3;}
+	pass{VertexShader = MainVS; PixelShader = UpsampleAtlasPS;  RenderTarget = Deferred::AlbedoTex;}	
+
+	//Smooth Normals
+	pass {VertexShader = MainVS;PixelShader = NormalsPS; RenderTarget = Deferred::NormalsTexV3; }	
+	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsMakeGbufPS;  RenderTarget = SmoothNormalsTempTex0;}
+	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsPass0PS;  RenderTarget = SmoothNormalsTempTex1;}
+	pass {VertexShader = SmoothNormalsVS;PixelShader = SmoothNormalsPass1PS;  RenderTarget = SmoothNormalsTempTex2;}
+	pass {VertexShader = SmoothNormalsVS;PixelShader = CopyNormalsPS; RenderTarget = Deferred::NormalsTexV3; }	
 
 #if LAUNCHPAD_DEBUG_OUTPUT != 0 //why waste perf for this pass in normal mode
 	pass {VertexShader = MainVS;PixelShader  = DebugPS;  }	
