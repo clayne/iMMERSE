@@ -159,6 +159,8 @@ uniform float4 tempF3 <
 //contains a few forward definitions, need to include it here
 #include ".\MartysMods\mmx_global.fxh"
 
+//#undef _COMPUTE_SUPPORTED
+
 texture ColorInputTex : COLOR;
 texture DepthInputTex : DEPTH;
 sampler ColorInput 	{ Texture = ColorInputTex; };
@@ -169,7 +171,14 @@ texture MXAOTex2 { Width = BUFFER_WIDTH_DLSS;   Height = BUFFER_HEIGHT_DLSS;   F
 sampler sMXAOTex1 { Texture = MXAOTex1; };
 sampler sMXAOTex2 { Texture = MXAOTex2; };
 
-#if !_COMPUTE_SUPPORTED
+texture ZSrc { Width = BUFFER_WIDTH_DLSS;   Height = BUFFER_HEIGHT_DLSS;   Format = R16F; };
+sampler sZSrc { Texture = ZSrc; MinFilter=POINT; MipFilter=POINT; MagFilter=POINT;};
+
+#if _COMPUTE_SUPPORTED
+storage stMXAOTex1       { Texture = MXAOTex1;        };
+storage stMXAOTex2       { Texture = MXAOTex2;        };
+storage2D stZSrc { Texture = ZSrc; };
+#else 
 texture MXAOTexRaw { Width = BUFFER_WIDTH_DLSS;   Height = BUFFER_HEIGHT_DLSS;   Format = RG16F;  };
 sampler sMXAOTexRaw { Texture = MXAOTexRaw;  MinFilter=POINT; MipFilter=POINT; MagFilter=POINT; };
 #endif
@@ -182,6 +191,17 @@ sampler sMXAOTexAccum  { Texture = MXAOTexAccum; };
 sampler sMXAOTexAccumPoint  { Texture = MXAOTexAccum; MinFilter=POINT; MipFilter=POINT; MagFilter=POINT;};
 texture MXAOTemporalSeedTex      < source = "iMMERSE_bluenoise_temporal.png"; > { Width = 4096; Height = 64; Format = RGBA8; };
 sampler	sMXAOTemporalSeedTex     { Texture = MXAOTemporalSeedTex; AddressU = WRAP; AddressV = WRAP; };
+
+#define DEINTERLEAVE_HIGH       0
+#define DEINTERLEAVE_TILE_COUNT 2u
+#else 
+    #if ((BUFFER_WIDTH_DLSS/4)*4) == BUFFER_WIDTH_DLSS
+        #define DEINTERLEAVE_HIGH       0
+        #define DEINTERLEAVE_TILE_COUNT 4u
+    #else 
+        #define DEINTERLEAVE_HIGH       1
+        #define DEINTERLEAVE_TILE_COUNT 5u
+    #endif
 #endif
 
 #include ".\MartysMods\mmx_depth.fxh"
@@ -190,40 +210,7 @@ sampler	sMXAOTemporalSeedTex     { Texture = MXAOTemporalSeedTex; AddressU = WRA
 #include ".\MartysMods\mmx_deferred.fxh"
 #include ".\MartysMods\mmx_qmc.fxh"
 
-//#undef _COMPUTE_SUPPORTED
-
-#ifdef _MARTYSMODS_TAAU_SCALE
-    #define DEINTERLEAVE_HIGH       0
-    #define DEINTERLEAVE_TILE_COUNT 2u
-#else 
-    #if ((BUFFER_WIDTH_DLSS/4)*4) == BUFFER_WIDTH_DLSS
-    #define DEINTERLEAVE_HIGH       0
-    #define DEINTERLEAVE_TILE_COUNT 4u
-    #else 
-    #define DEINTERLEAVE_HIGH       1
-    #define DEINTERLEAVE_TILE_COUNT 5u
-    #endif
-#endif
-
 uniform uint FRAMECOUNT < source = "framecount"; >;
-
-#if _COMPUTE_SUPPORTED
-storage stMXAOTex1       { Texture = MXAOTex1;        };
-storage stMXAOTex2       { Texture = MXAOTex2;        };
-
-texture3D ZSrc3D 
-{ 
-    Width = BUFFER_WIDTH_DLSS/DEINTERLEAVE_TILE_COUNT;   
-    Height = BUFFER_HEIGHT_DLSS/DEINTERLEAVE_TILE_COUNT;   
-    Depth = DEINTERLEAVE_TILE_COUNT * DEINTERLEAVE_TILE_COUNT;   
-    Format = R16F;
-};
-sampler3D sZSrc3D { Texture = ZSrc3D; MinFilter=POINT; MipFilter=POINT; MagFilter=POINT;};
-storage3D stZSrc3D { Texture = ZSrc3D; };
-#else 
-texture ZSrc { Width = BUFFER_WIDTH_DLSS;   Height = BUFFER_HEIGHT_DLSS;   Format = R16F; };
-sampler sZSrc { Texture = ZSrc; MinFilter=POINT; MipFilter=POINT; MagFilter=POINT;};
-#endif
 
 struct VSOUT
 {
@@ -364,6 +351,7 @@ void process_horizons(float2 h)
 {
     uint a = uint(h.x * 32);
     uint b = ceil(saturate(h.y - h.x) * 32); //ceil? using half occlusion here, this attenuates effect when an occluder is so far away that can't cover half a sector
+    b = uint(h.y * 32) - a;    
     uint occlusion = ((1 << b) - 1) << a;
     occlusion_bitfield &= ~occlusion; //somehow "and" is faster than "or" based occlusion
 }
@@ -371,12 +359,6 @@ void process_horizons(float2 h)
 float integrate_sectors()
 {
     return saturate(countbits(occlusion_bitfield) / 32.0);
-}
-
-//read from deinterleave volume
-float read_z(float2 uv, float w)
-{
-    return tex3Dlod(sZSrc3D, float4(uv, w, 0)).x;
 }
 
 bool shading_rate(uint2 tile_idx)
@@ -436,12 +418,6 @@ void process_horizons(float2 h)
     occlusion_bitfield = bitfield_set_bits(occlusion_bitfield, a, b);
 }
 
-//read from tiled texture
-float read_z(float2 uv, float w)
-{
-    return tex2Dlod(sZSrc, uv, 0).x;
-}
-
 bool shading_rate(uint2 tile_idx)
 {
     bool skip_pixel = false;
@@ -469,7 +445,7 @@ VSOUT MainVS(in uint id : SV_VertexID)
 }
 
 #if _COMPUTE_SUPPORTED
-void Deinterleave3DCS(in CSIN i)
+void DeinterleaveCS(in CSIN i)
 {
     if(!check_boundaries(i.dispatchthreadid.xy * 2, BUFFER_SCREEN_SIZE_DLSS)) return;
 
@@ -495,17 +471,9 @@ void Deinterleave3DCS(in CSIN i)
     [unroll]
     for(uint j = 0; j < 4; j++)
     {
-        uint2 screenpos = i.dispatchthreadid.xy * 2 + offsets[j];
-
-        const uint tilecount = DEINTERLEAVE_TILE_COUNT;
-
-        uint3 write_pos;
-        write_pos.xy = screenpos / tilecount;
-        uint2 tile_idx = screenpos - write_pos.xy * tilecount;
-        write_pos.z = tile_idx.x + tile_idx.y * tilecount;
-
-        tex3Dstore(stZSrc3D, write_pos, depth_texels[j]);
-    }
+        uint2 write_pos = deinterleave_pos(i.dispatchthreadid.xy * 2 + offsets[j], DEINTERLEAVE_TILE_COUNT, BUFFER_SCREEN_SIZE_DLSS);
+        tex2Dstore(stZSrc, write_pos, depth_texels[j]);
+    }   
 }
 #else 
 void DepthInterleavePS(in VSOUT i, out float o : SV_Target0)
@@ -514,10 +482,9 @@ void DepthInterleavePS(in VSOUT i, out float o : SV_Target0)
     o = Camera::depth_to_z(Depth::get_linear_depth(get_uv));
 }
 #endif
-
-float2 MXAOFused(uint2 screenpos, float4 uv, float depth_layer)
+float2 MXAOFused(uint2 screenpos, float4 uv)
 { 	
-    float z = read_z(uv.xy, depth_layer);
+    float z = tex2Dlod(sZSrc, uv.xy, 0).x;
     float d = Camera::z_to_depth(z);
 
     [branch]
@@ -529,11 +496,7 @@ float2 MXAOFused(uint2 screenpos, float4 uv, float depth_layer)
     p = p * 0.996;
     float3 v = normalize(-p);  
 
-#if _COMPUTE_SUPPORTED
-    static const float4 texture_scale = BUFFER_ASPECT_RATIO_DLSS.xyxy;
-#else
-    static const float4 texture_scale = float2(1.0 / DEINTERLEAVE_TILE_COUNT, 1.0).xxyy * BUFFER_ASPECT_RATIO_DLSS.xyxy;
-#endif
+    float4 texture_scale = float2(1.0 / DEINTERLEAVE_TILE_COUNT, 1.0).xxyy * BUFFER_ASPECT_RATIO_DLSS.xyxy;
 
     uint slice_count  = samples_per_preset[MXAO_GLOBAL_SAMPLE_QUALITY_PRESET].x;    
     uint sample_count = samples_per_preset[MXAO_GLOBAL_SAMPLE_QUALITY_PRESET].y; 
@@ -599,8 +562,8 @@ float2 MXAOFused(uint2 screenpos, float4 uv, float depth_layer)
                 if(!all(saturate(tap_uv[1].zw - tap_uv[1].zw * tap_uv[1].zw))) break;                       
 
                 float2 zz; //https://developer.nvidia.com/blog/the-peak-performance-analysis-method-for-optimizing-any-gpu-workload/
-                zz.x = read_z(tap_uv[0].xy, depth_layer); 
-                zz.y = read_z(tap_uv[1].xy, depth_layer);               
+                zz.x = tex2Dlod(sZSrc, tap_uv[0].xy, 0).x;
+                zz.y = tex2Dlod(sZSrc, tap_uv[1].xy, 0).x;
 
                 [unroll] //less VGPR by splitting
                 for(uint pair = 0; pair < 2; pair++)
@@ -619,10 +582,12 @@ float2 MXAOFused(uint2 screenpos, float4 uv, float depth_layer)
 
                     h_frontback = Math::fast_acos(h_frontback);
                     h_frontback = side ? h_frontback : -h_frontback.yx;//flip sign and sort in the same cmov, efficiency baby!
-                    h_frontback = saturate((h_frontback + normal_angle) / PI + 0.5);
+
+                    h_frontback = saturate((h_frontback + normal_angle) / PI + 0.5);                              
 #if MXAO_AO_TYPE == 2
                     //this almost perfectly approximates inverse transform sampling for cosine lobe
                     h_frontback = h_frontback * h_frontback * (3.0 - 2.0 * h_frontback); 
+                    //if(tempF1.y > 0) h_frontback = saturate(h_frontback + QMC::roberts1(slice_count * sample_count + _sample, jitter.y) / 32.0);
 #endif                   
                     process_horizons(h_frontback);
 #endif  //MXAO_AO_TYPE        
@@ -662,30 +627,26 @@ float2 MXAOFused(uint2 screenpos, float4 uv, float depth_layer)
 }
 
 #if _COMPUTE_SUPPORTED
-void OcclusionWrap3DCS(in CSIN i)
-{    
-    const uint tilecount = DEINTERLEAVE_TILE_COUNT;
-    const uint2 tilesize = BUFFER_SCREEN_SIZE_DLSS / tilecount;    
+void OcclusionWrapCS(in CSIN i)
+{
+    if(!check_boundaries(i.dispatchthreadid.xy, CEIL_DIV(BUFFER_SCREEN_SIZE_DLSS, DEINTERLEAVE_TILE_COUNT) * DEINTERLEAVE_TILE_COUNT)) return; 
 
-    uint2 tile_idx;
-    tile_idx.y = i.dispatchthreadid.z / tilecount;
-    tile_idx.x = i.dispatchthreadid.z - tile_idx.y * tilecount; 
+    uint2 screen_pos = reinterleave_pos(i.dispatchthreadid.xy, DEINTERLEAVE_TILE_COUNT, BUFFER_SCREEN_SIZE_DLSS);
+    uint2 tile_idx = i.dispatchthreadid.xy / CEIL_DIV(BUFFER_SCREEN_SIZE_DLSS, DEINTERLEAVE_TILE_COUNT);
 
-    if(!check_boundaries(i.dispatchthreadid.xy, tilesize) || shading_rate(tile_idx)) return;
-
-    uint2 screen_pos = i.dispatchthreadid.xy * tilecount + tile_idx;
+    if(shading_rate(tile_idx)) return;
+   
     float4 uv;
-    uv.xy = pixel_idx_to_uv(i.dispatchthreadid.xy, tilesize);
-    uv.zw = pixel_idx_to_uv(screen_pos, BUFFER_SCREEN_SIZE_DLSS);    
+    uv.xy = pixel_idx_to_uv(i.dispatchthreadid.xy, BUFFER_SCREEN_SIZE_DLSS);
+    uv.zw = pixel_idx_to_uv(screen_pos, BUFFER_SCREEN_SIZE_DLSS);
 
-    float depth_layer = i.dispatchthreadid.z * rcp(tilecount * tilecount);    
-    float2 ao_and_guide = MXAOFused(screen_pos, uv, depth_layer);
+    float2 o = MXAOFused(screen_pos, uv);
 
-    ao_and_guide.x = lerp(1, ao_and_guide.x, saturate(MXAO_SSAO_AMOUNT)); 
-    if(MXAO_SSAO_AMOUNT > 1) ao_and_guide.x = lerp(ao_and_guide.x, ao_and_guide.x * ao_and_guide.x, saturate(MXAO_SSAO_AMOUNT - 1)); //if someone _MUST_ use a higher intensity, switch to gamma
-    ao_and_guide.x = lerp(1, ao_and_guide.x, get_fade_factor(ao_and_guide.y));
+    o.x = lerp(1, o.x, saturate(MXAO_SSAO_AMOUNT)); 
+    if(MXAO_SSAO_AMOUNT > 1) o.x = lerp(o.x, o.x * o.x, saturate(MXAO_SSAO_AMOUNT - 1)); //if someone _MUST_ use a higher intensity, switch to gamma
+    o.x = lerp(1, o.x, get_fade_factor(o.y));
 
-    tex2Dstore(stMXAOTex1, screen_pos, float4(ao_and_guide.xy, ao_and_guide.xy * ao_and_guide.xy));
+    tex2Dstore(stMXAOTex1, screen_pos, float4(o.xy, o.xy * o.xy));    
 }
 #else 
 void OcclusionWrap1PS(in VSOUT i, out float4 o : SV_Target0) //writes to MXAOTex2
@@ -700,7 +661,7 @@ void OcclusionWrap1PS(in VSOUT i, out float4 o : SV_Target0) //writes to MXAOTex
     uv.xy = pixel_idx_to_uv(dispatchthreadid, BUFFER_SCREEN_SIZE_DLSS);
     //uv.zw = pixel_idx_to_uv(write_pos, BUFFER_SCREEN_SIZE);
     uv.zw = deinterleave_uv(uv.xy); //no idea why _this_ works but the other doesn't but that's just DX9 being a jackass I guess
-    o.xy = MXAOFused(write_pos, uv, 0.0);
+    o.xy = MXAOFused(write_pos, uv);
 
     o.x = lerp(1, o.x, saturate(MXAO_SSAO_AMOUNT)); 
     if(MXAO_SSAO_AMOUNT > 1) o.x = lerp(o.x, o.x * o.x, saturate(MXAO_SSAO_AMOUNT - 1)); //if someone _MUST_ use a higher intensity, switch to gamma
@@ -872,16 +833,15 @@ technique MartysMods_MXAO
 #if _COMPUTE_SUPPORTED
     pass 
     { 
-        ComputeShader = Deinterleave3DCS<32, 32>;
+        ComputeShader = DeinterleaveCS<32, 32>;
         DispatchSizeX = CEIL_DIV(BUFFER_WIDTH_DLSS, 64); 
         DispatchSizeY = CEIL_DIV(BUFFER_HEIGHT_DLSS, 64);
     }
     pass 
     { 
-        ComputeShader = OcclusionWrap3DCS<16, 16, 1>;
-        DispatchSizeX = CEIL_DIV((BUFFER_WIDTH_DLSS/DEINTERLEAVE_TILE_COUNT), 16); 
-        DispatchSizeY = CEIL_DIV((BUFFER_HEIGHT_DLSS/DEINTERLEAVE_TILE_COUNT), 16);
-        DispatchSizeZ = DEINTERLEAVE_TILE_COUNT * DEINTERLEAVE_TILE_COUNT;
+        ComputeShader = OcclusionWrapCS<16, 16>;
+        DispatchSizeX = CEIL_DIV(BUFFER_WIDTH_DLSS, 16); 
+        DispatchSizeY = CEIL_DIV(BUFFER_HEIGHT_DLSS, 16);
     }
 #else 
     pass { VertexShader = MainVS; PixelShader = DepthInterleavePS; RenderTarget = ZSrc; }
